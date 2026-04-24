@@ -5,11 +5,11 @@ import http.cookiejar
 import secrets
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from config import cfg
 from logger import setup_logger
-from .parser import parse_mxml_response, AMIResponse
+from .parser import parse_mxml_response, AMIResponse, parse_agents
 
 log = setup_logger("ami.client")
 
@@ -159,6 +159,13 @@ class AMIClient:
         self._authenticated = False
         log.info("AMI client stopped")
     
+    def queue_show(self, queue_name: str) -> List[Dict[str, str]]:
+        resp = self._request("command", {"command": f"queue show {queue_name}"})
+        if not resp.success:
+            log.error(f"queue show {queue_name} failed: {resp.message}")
+            return []
+        return parse_agents(resp.command_output)
+
     @property
     def authenticated(self) -> bool:
         with self._lock:

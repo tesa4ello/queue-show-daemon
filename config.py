@@ -31,4 +31,12 @@ class Config:
     AMI_TIMEOUT = int(os.getenv("AMI_TIMEOUT", "10"))
     KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "30"))
 
+    #Database
+    # MySQL
+    MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+    MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+    MYSQL_BASE = os.getenv("MYSQL_NAME", "asterisk")
+    MYSQL_USER = os.getenv("MYSQL_USER", "asterisk")
+    MYSQL_PASS = os.getenv("MYSQL_PASS", "asterisk")
+
 cfg = Config()
