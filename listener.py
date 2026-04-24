@@ -36,7 +36,7 @@ class QueueHandler(BaseHTTPRequestHandler):
         if not db_client:
             return self._respond(503, {"error": "DB not connected"})
 
-        log.info(f"[REQUEST] queues={queues} from {self.client_address[0]}")
+        log.debug(f"[REQUEST] queues={queues} from {self.client_address[0]}")
 
         # 1. Собираем уникальных агентов из AMI
         seen_ids, ami_agents = set(), {}
@@ -53,12 +53,23 @@ class QueueHandler(BaseHTTPRequestHandler):
         result = {}
         for aid, ami_data in ami_agents.items():
             db = db_records.get(aid, {})
+            member = ami_data["member"]
+            phone_raw = ami_data["phone"]
+
+            # Логика state
+            if member != "online":
+                state = db.get("state", "unknown")
+            elif phone_raw == "used":
+                state = "busy"
+            else:
+                state = "online"
+
             result[aid] = {
                 "name": str(db.get("name", "")),
                 "phonenum": str(db.get("agentphone", "")),
                 "id": aid,
-                "phone": PHONE_MAP.get(ami_data["phone"], "phoneunknown"),
-                "state": db.get("state", "unknown") if ami_data["member"] != "online" else "online",
+                "phone": PHONE_MAP.get(phone_raw, "phoneunknown"),
+                "state": state,
                 "dateofchange": str(db.get("changed", ""))
             }
 
