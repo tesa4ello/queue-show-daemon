@@ -4,7 +4,6 @@ import urllib.parse
 import http.cookiejar
 import secrets
 import threading
-import time
 from typing import Optional, Dict, List
 from config import cfg
 from logger import setup_logger
@@ -29,7 +28,7 @@ class AMIClient:
     def _generate_action_id(self):
         return f"queue-proxy-{secrets.token_hex(3)}"
 
-    def _request(self, action: str, params: Optional[Dict] = None) -> AMIResponse:
+    def _request(self, action: str, params: Optional[Dict] = None, retry: bool = True) -> AMIResponse:
         data = {"Action": action, "ActionID": self._generate_action_id()}
         if params:
             data.update(params)
@@ -37,17 +36,33 @@ class AMIClient:
         req = urllib.request.Request(self.base_url, data=payload, method='POST')
         req.add_header('Content-Type', 'application/x-www-form-urlencoded')
         log.debug(f"AMI -> {action}")
+
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
-            return parse_rawman_response(raw)
+            parsed = parse_rawman_response(raw)
         except Exception as e:
             log.error(f"AMI request failed: {e}")
             return AMIResponse(False, "Error", str(e), None, {}, [])
 
+        # 🔁 Авто-реавторизация при Permission denied
+        if retry and action not in ("Login", "Logoff"):
+            msg = parsed.message or ""
+            if parsed.response_type == "Error" and "permission denied" in msg.lower():
+                log.warning("Permission denied, session expired. Re-authenticating...")
+                with self._lock:
+                    self._authenticated = False
+                self._cookie_jar.clear()
+                if self.login():
+                    return self._request(action, params, retry=False)  # Повторяем 1 раз
+                else:
+                    log.error("Re-authentication failed after Permission denied")
+
+        return parsed
+
     def login(self) -> bool:
-        resp = self._request("Login", {"Username": self.user, "Secret": self.secret})
-        if resp.success and "accepted" in resp.message.lower():
+        resp = self._request("Login", {"Username": self.user, "Secret": self.secret}, retry=False)
+        if resp.success and "accepted" in (resp.message or "").lower():
             with self._lock: self._authenticated = True
             log.info("AMI authentication accepted")
             return True
@@ -55,8 +70,8 @@ class AMIClient:
         return False
 
     def logoff(self) -> bool:
-        resp = self._request("Logoff")
-        if resp.response_type == "Goodbye" or "goodbye" in resp.message.lower():
+        resp = self._request("Logoff", retry=False)
+        if resp.response_type == "Goodbye" or "goodbye" in (resp.message or "").lower():
             log.info("AMI session closed")
             with self._lock: self._authenticated = False
             self._cookie_jar.clear()
@@ -65,15 +80,7 @@ class AMIClient:
 
     def ping(self) -> bool:
         resp = self._request("Ping")
-        if resp.headers.get("Ping", "").lower() == "pong":
-            log.debug("AMI pong received")
-            return True
-        if resp.response_type == "Error" and "permission denied" in resp.message.lower():
-            log.warning("AMI session expired")
-            with self._lock: self._authenticated = False
-            self._cookie_jar.clear()
-            return False
-        return False
+        return resp.headers.get("Ping", "").lower() == "pong"
 
     def queue_show(self, queue_name: str) -> List[Dict]:
         resp = self._request("Command", {"Command": f"queue show {queue_name}"})
@@ -89,10 +96,12 @@ class AMIClient:
                 break
             if not self._authenticated:
                 if not self.login():
-                    log.warning("Re-login failed")
+                    log.warning("Re-login failed in keepalive")
                     continue
             if not self.ping():
-                log.warning("Ping failed, re-login...")
+                log.warning("Ping failed, session likely expired. Forcing re-login...")
+                with self._lock: self._authenticated = False
+                self._cookie_jar.clear()
                 self.login()
 
     def start(self) -> bool:
