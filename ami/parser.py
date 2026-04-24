@@ -1,64 +1,85 @@
 # ami/parser.py
 import re
-import xml.etree.ElementTree as ET
 from typing import Optional, Dict, List
 from logger import setup_logger
 
 log = setup_logger("ami.parser")
 
 class AMIResponse:
-    def __init__(self, success: bool, response_type: str, message: str, 
-                 action_id: Optional[str] = None, extra: Optional[Dict] = None,
-                 command_output: Optional[List[str]] = None):
+    def __init__(self, success: bool, response_type: str, message: str,
+                 action_id: Optional[str] = None, headers: Optional[Dict] = None,
+                 output_lines: Optional[List[str]] = None):
         self.success = success
         self.response_type = response_type
         self.message = message
         self.action_id = action_id
-        self.extra = extra or {}
-        self.command_output = command_output or []
+        self.headers = headers or {}
+        self.output_lines = output_lines or []
 
-def parse_mxml_response(xml_raw: bytes) -> AMIResponse:
-    try:
-        root = ET.fromstring(xml_raw.decode("utf-8", errors="replace"))
-        generic = root.find(".//generic")
-        if generic is None:
-            return AMIResponse(False, "Unknown", "Parse error")
-        
-        resp_type = generic.get("response", "Unknown")
-        message = generic.get("message", "")
-        action_id = generic.get("actionid")
-        extra = {k: v for k, v in generic.attrib.items() 
-                 if k not in ("response", "message", "actionid")}
-        
-        command_output = []
-        for i in range(1, 50):
-            key = f"output" if i == 1 else f"output-{i}"
-            val = generic.get(key)
-            if val is None: break
-            if val.strip(): command_output.append(val.strip())
-            
-        return AMIResponse(resp_type in ("Success", "Goodbye"), resp_type, message, 
-                           action_id, extra, command_output)
-    except Exception as e:
-        log.error(f"XML parse error: {e}")
-        return AMIResponse(False, "Exception", str(e))
+def parse_rawman_response(raw: bytes) -> AMIResponse:
+    text = raw.decode('utf-8', errors='replace').strip()
+    if not text:
+        return AMIResponse(False, "Empty", "No response")
 
-def parse_agents(raw_lines: List[str]) -> List[Dict[str, str]]:
-    """Парсит вывод queue show, оставляя только агентов."""
+    lines = text.splitlines()
+    headers = {}
+    output_lines = []
+    response_type = None
+    message = ""
+    action_id = None
+    in_output = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        if in_output:
+            output_lines.append(line)
+            continue
+
+        if ':' in line:
+            key, _, val = line.partition(':')
+            key = key.strip()
+            val = val.strip()
+            headers[key] = val
+
+            lk = key.lower()
+            if lk == 'response': response_type = val
+            elif lk == 'message': message = val
+            elif lk == 'actionid': action_id = val
+
+            if lk == 'response' and val.lower() == 'follows':
+                in_output = True
+        elif response_type and response_type.lower() in ('success', 'follows') and 'command output follows' in message.lower():
+            output_lines.append(line)
+
+    # Убираем префикс "Output: " если есть
+    cleaned = []
+    for ln in output_lines:
+        if ln.startswith("Output: "):
+            cleaned.append(ln[8:])
+        elif ln.startswith("Output:"):
+            cleaned.append(ln[7:].strip())
+        else:
+            cleaned.append(ln)
+
+    success = response_type in ('Success', 'Follows', 'Goodbye')
+    return AMIResponse(success, response_type or "Unknown", message, action_id, headers, cleaned)
+
+def parse_agents(raw_lines: List[str]) -> List[Dict]:
     seen_ids = set()
     result = []
     for line in raw_lines:
-        # Отсекаем строку самой очереди и заголовки
         if "has taken" not in line.lower():
             continue
         m = re.match(r"^(\d+)", line)
         if not m: continue
-
         low = line.lower()
         agent = {
             "id": m.group(1),
             "member": "paused" if "paused" in low else "online",
-            "phone": "not_in_use" if "not in use" in low else 
+            "phone": "not_in_use" if "not in use" in low else
                      ("ringing" if "ring" in low else "used")
         }
         if agent["id"] not in seen_ids:

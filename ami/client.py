@@ -5,168 +5,114 @@ import http.cookiejar
 import secrets
 import threading
 import time
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, List
 from config import cfg
 from logger import setup_logger
-from .parser import parse_mxml_response, AMIResponse, parse_agents
+from .parser import parse_rawman_response, AMIResponse, parse_agents
 
 log = setup_logger("ami.client")
 
 class AMIClient:
-    """Клиент к Asterisk HTTP-AMI (mxml интерфейс) с поддержкой сессий."""
-    
-    def __init__(self, host: str, port: int, user: str, secret: str, 
-                 timeout: int = 10, keepalive_interval: int = 30):
-        self.base_url = f"http://{host}:{port}/mxml"
+    def __init__(self, host, port, user, secret, timeout=10, keepalive_interval=30):
+        self.base_url = f"http://{host}:{port}/rawman"
         self.user = user
         self.secret = secret
         self.timeout = timeout
         self.keepalive_interval = keepalive_interval
-        
-        # CookieJar для сохранения сессии
         self._cookie_jar = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._cookie_jar)
-        )
-        
+        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cookie_jar))
         self._authenticated = False
         self._stop_keepalive = threading.Event()
         self._keepalive_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
-    
-    def _generate_action_id(self) -> str:
+
+    def _generate_action_id(self):
         return f"queue-proxy-{secrets.token_hex(3)}"
-    
-    def _build_params(self, action: str, params: Optional[Dict] = None) -> Dict:
-        result = {
-            "action": action,
-            "actionID": self._generate_action_id()
-        }
-        if params:
-            result.update(params)
-        return result
-    
+
     def _request(self, action: str, params: Optional[Dict] = None) -> AMIResponse:
-        """Отправить GET-запрос к mxml с сохранёнными куками."""
-        full_params = self._build_params(action, params)
-        query = urllib.parse.urlencode(full_params)
-        url = f"{self.base_url}?{query}"
-        
-        log.debug(f"AMI -> {action} (actionID={full_params['actionID']})")
-        req = urllib.request.Request(url, method="GET")
-        
-        with self._opener.open(req, timeout=self.timeout) as resp:
-            raw = resp.read()
-        return parse_mxml_response(raw)
-    
+        data = {"Action": action, "ActionID": self._generate_action_id()}
+        if params:
+            data.update(params)
+        payload = urllib.parse.urlencode(data).encode('utf-8')
+        req = urllib.request.Request(self.base_url, data=payload, method='POST')
+        req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+        log.debug(f"AMI -> {action}")
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+            return parse_rawman_response(raw)
+        except Exception as e:
+            log.error(f"AMI request failed: {e}")
+            return AMIResponse(False, "Error", str(e), None, {}, [])
+
     def login(self) -> bool:
-        """Выполнить авторизацию."""
-        resp = self._request("login", {
-            "username": self.user,
-            "secret": self.secret
-        })
-        
-        if resp.success and resp.response_type == "Success":
-            with self._lock:
-                self._authenticated = True
+        resp = self._request("Login", {"Username": self.user, "Secret": self.secret})
+        if resp.success and "accepted" in resp.message.lower():
+            with self._lock: self._authenticated = True
             log.info("AMI authentication accepted")
             return True
-        elif resp.response_type == "Error" and "Authentication failed" in resp.message:
-            log.error(f"AMI authentication failed: {resp.message}")
-            return False
-        else:
-            log.warning(f"Unexpected login response: {resp}")
-            return False
-    
+        log.error(f"AMI auth failed: {resp.message}")
+        return False
+
     def logoff(self) -> bool:
-        """Завершить сессию."""
-        resp = self._request("logoff")
-        
-        if resp.response_type == "Goodbye":
+        resp = self._request("Logoff")
+        if resp.response_type == "Goodbye" or "goodbye" in resp.message.lower():
             log.info("AMI session closed")
-            with self._lock:
-                self._authenticated = False
-            # Очистить куки после логаута
+            with self._lock: self._authenticated = False
             self._cookie_jar.clear()
             return True
-        else:
-            log.warning(f"Unexpected logoff response: {resp}")
-            return False
-    
+        return False
+
     def ping(self) -> bool:
-        """Отправить ping, вернуть True если получили Pong."""
-        resp = self._request("ping")
-        
-        if resp.extra.get("ping") == "Pong":
+        resp = self._request("Ping")
+        if resp.headers.get("Ping", "").lower() == "pong":
             log.debug("AMI pong received")
             return True
-        elif resp.response_type == "Error" and "Permission denied" in resp.message:
-            log.warning("AMI session expired (Permission denied)")
-            with self._lock:
-                self._authenticated = False
-            self._cookie_jar.clear()  # сбросить невалидные куки
+        if resp.response_type == "Error" and "permission denied" in resp.message.lower():
+            log.warning("AMI session expired")
+            with self._lock: self._authenticated = False
+            self._cookie_jar.clear()
             return False
-        else:
-            log.warning(f"Unexpected ping response: {resp}")
-            return False
-    
-    def command(self, command: str) -> AMIResponse:
-        """Выполнить CLI-команду через AMI."""
-        return self._request("command", {"command": command})
-    
+        return False
+
+    def queue_show(self, queue_name: str) -> List[Dict]:
+        resp = self._request("Command", {"Command": f"queue show {queue_name}"})
+        if not resp.success:
+            log.error(f"queue show {queue_name} failed: {resp.message}")
+            return []
+        return parse_agents(resp.output_lines)
+
     def _keepalive_loop(self):
-        """Фоновый цикл отправки ping."""
         log.info(f"Keepalive started (interval={self.keepalive_interval}s)")
         while not self._stop_keepalive.is_set():
             if self._stop_keepalive.wait(timeout=self.keepalive_interval):
                 break
             if not self._authenticated:
-                log.debug("Not authenticated, attempting re-login...")
                 if not self.login():
-                    log.warning("Re-login failed, will retry later")
+                    log.warning("Re-login failed")
                     continue
             if not self.ping():
-                log.warning("Ping failed, attempting re-login...")
+                log.warning("Ping failed, re-login...")
                 self.login()
-    
+
     def start(self) -> bool:
-        """Инициализировать соединение: логин + запуск keepalive."""
-        if not self.login():
-            return False
-        
+        if not self.login(): return False
         self._stop_keepalive.clear()
-        self._keepalive_thread = threading.Thread(
-            target=self._keepalive_loop, daemon=True, name="ami-keepalive"
-        )
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True, name="ami-keepalive")
         self._keepalive_thread.start()
         return True
-    
+
     def stop(self):
-        """Корректно завершить: остановить keepalive и отправить logoff."""
         log.info("Stopping AMI client...")
         self._stop_keepalive.set()
-        
         if self._keepalive_thread and self._keepalive_thread.is_alive():
             self._keepalive_thread.join(timeout=2.0)
-        
         if self._authenticated:
-            try:
-                self.logoff()
-            except Exception as e:
-                log.warning(f"Error during logoff: {e}")
-        
+            try: self.logoff()
+            except Exception as e: log.warning(f"Logoff error: {e}")
         self._authenticated = False
         log.info("AMI client stopped")
-    
-    def queue_show(self, queue_name: str) -> List[Dict[str, str]]:
-        resp = self._request("command", {"command": f"queue show {queue_name}"})
-        if not resp.success:
-            log.error(f"queue show {queue_name} failed: {resp.message}")
-            return []
-        return parse_agents(resp.command_output)
 
     @property
     def authenticated(self) -> bool:
-        with self._lock:
-            return self._authenticated
+        with self._lock: return self._authenticated
