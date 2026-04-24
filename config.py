@@ -35,7 +35,7 @@ class Config:
     # MySQL
     MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
     MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-    MYSQL_BASE = os.getenv("MYSQL_NAME", "asterisk")
+    MYSQL_BASE = os.getenv("MYSQL_BASE", "asterisk")
     MYSQL_USER = os.getenv("MYSQL_USER", "asterisk")
     MYSQL_PASS = os.getenv("MYSQL_PASS", "asterisk")
 
