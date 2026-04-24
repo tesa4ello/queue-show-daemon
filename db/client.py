@@ -1,6 +1,7 @@
 # db/client.py
 import pymysql
 import threading
+from typing import Optional, List, Dict
 from logger import setup_logger
 
 log = setup_logger("db.client")
@@ -24,7 +25,7 @@ class DBClient:
             log.error(f"MySQL connection failed: {e}")
             raise
 
-    def fetch(self, sql: str, params: tuple | None = None) -> list[dict]:
+    def fetch(self, sql: str, params: Optional[tuple] = None) -> List[Dict]:
         with self._lock:
             try:
                 with self.conn.cursor() as cur:
@@ -37,7 +38,7 @@ class DBClient:
                     cur.execute(sql, params)
                     return cur.fetchall()
 
-    def get_agents_by_ids(self, agent_ids: list[str]) -> dict[str, dict]:
+    def get_agents_by_ids(self, agent_ids: List[str]) -> Dict[str, Dict]:
         if not agent_ids: return {}
         placeholders = ','.join(['%s'] * len(agent_ids))
         sql = f"SELECT agentid, state, agentphone, name, dateofchange AS changed FROM queue_agents WHERE agentid IN ({placeholders})"
