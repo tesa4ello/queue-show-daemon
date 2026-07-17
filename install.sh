@@ -11,17 +11,40 @@ PYTHON_BIN="$(command -v python3 || echo "/usr/bin/python3")"
 
 echo "🔧 Installing ${SERVICE_NAME}..."
 
-# 1. Подготовка директории
+# 1. Подготовка директории (без .git и __pycache__)
 mkdir -p "${INSTALL_DIR}"
-cp -r "${SCRIPT_DIR}"/* "${INSTALL_DIR}/"
+cp -r "${SCRIPT_DIR}/ami" "${SCRIPT_DIR}/db" "${INSTALL_DIR}/"
+cp "${SCRIPT_DIR}"/*.py "${SCRIPT_DIR}/requirements.txt" "${SCRIPT_DIR}/.env.example" "${INSTALL_DIR}/"
+find "${INSTALL_DIR}" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# 2. Инициализация .env
+# 2. Инициализация .env (не затираем существующий конфиг при переустановке)
 if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
-    cp ".env.example" "${INSTALL_DIR}/.env"
+    cp "${SCRIPT_DIR}/.env.example" "${INSTALL_DIR}/.env"
     echo "📝 .env created from template. Edit before first run!"
 fi
 
-# 3. Генерация systemd-юнита с подстановкой путей
+# 3. Установка Python-зависимостей (PyMySQL)
+echo "📦 Installing Python dependencies..."
+if ! "${PYTHON_BIN}" -c "import pymysql" 2>/dev/null; then
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y python3-pymysql >/dev/null 2>&1 || true
+    fi
+fi
+if ! "${PYTHON_BIN}" -c "import pymysql" 2>/dev/null; then
+    if "${PYTHON_BIN}" -m pip --version &>/dev/null; then
+        "${PYTHON_BIN}" -m pip install -r "${INSTALL_DIR}/requirements.txt" \
+            || "${PYTHON_BIN}" -m pip install --break-system-packages -r "${INSTALL_DIR}/requirements.txt" \
+            || true
+    fi
+fi
+if "${PYTHON_BIN}" -c "import pymysql" 2>/dev/null; then
+    echo "✅ PyMySQL present"
+else
+    echo "❌ PyMySQL is missing — install it manually before starting:"
+    echo "     apt-get install -y python3-pymysql   # или:  pip3 install PyMySQL"
+fi
+
+# 4. Генерация systemd-юнита с подстановкой путей
 echo "⚙️ Generating systemd unit..."
 cat > "${SYSTEMD_FILE}" <<EOF
 [Unit]
@@ -46,13 +69,13 @@ SyslogIdentifier=${SERVICE_NAME}
 WantedBy=multi-user.target
 EOF
 
-# 4. Регистрация и запуск
+# 5. Регистрация и запуск
 echo "🔄 Reloading systemd..."
 systemctl daemon-reload
 
-echo "🚀 Enabling & starting service..."
+echo "🚀 Enabling & (re)starting service..."
 systemctl enable "${SERVICE_NAME}"
-systemctl start "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
 
 echo ""
 echo "✅ Installation complete!"
