@@ -39,7 +39,7 @@ def main():
         sys.exit(1)
 
     set_clients(ami_client,db_client)
-    start_listener(cfg.HTTP_HOST, cfg.HTTP_PORT)
+    http_server = start_listener(cfg.HTTP_HOST, cfg.HTTP_PORT)
 
     log.info("Daemon running")
     try:
@@ -48,6 +48,7 @@ def main():
     except Exception as e:
         log.error(f"Main loop error: {e}")
     finally:
+        if http_server: http_server.shutdown()
         if ami_client: ami_client.stop()
         if db_client: db_client.close()  # <-- новое
         log.info("Daemon stopped")

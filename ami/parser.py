@@ -5,89 +5,96 @@ from logger import setup_logger
 
 log = setup_logger("ami.parser")
 
+
 class AMIResponse:
     def __init__(self, success: bool, response_type: str, message: str,
                  action_id: Optional[str] = None, headers: Optional[Dict] = None,
-                 output_lines: Optional[List[str]] = None):
+                 events: Optional[List[Dict]] = None):
         self.success = success
         self.response_type = response_type
         self.message = message
         self.action_id = action_id
+        # headers -> поля первого блока ответа (Response/Message/ActionID/Ping/...)
         self.headers = headers or {}
-        self.output_lines = output_lines or []
+        # events -> последующие блоки-события (QueueMember, QueueEntry, ...)
+        self.events = events or []
+
+
+def _parse_blocks(text: str) -> List[Dict[str, str]]:
+    """Разбирает ответ rawman в список блоков.
+
+    rawman/HTTP возвращает заголовок ответа и все сгенерированные действием
+    события в одном HTTP-ответе; блоки разделяются пустой строкой, внутри блока —
+    строки вида ``key: value``.
+    """
+    blocks: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    for line in text.splitlines():
+        if line.strip() == "":
+            if current:
+                blocks.append(current)
+                current = {}
+            continue
+        if ":" in line:
+            key, _, val = line.partition(":")
+            current[key.strip()] = val.strip()
+    if current:
+        blocks.append(current)
+    return blocks
+
 
 def parse_rawman_response(raw: bytes) -> AMIResponse:
-    text = raw.decode('utf-8', errors='replace').strip()
-    if not text:
+    text = raw.decode("utf-8", errors="replace")
+    blocks = _parse_blocks(text)
+    if not blocks:
         return AMIResponse(False, "Empty", "No response")
 
-    lines = text.splitlines()
-    headers = {}
-    output_lines = []
-    response_type = None
-    message = ""
-    action_id = None
-    in_output = False
+    head = blocks[0]
+    lower = {k.lower(): v for k, v in head.items()}  # регистронезависимый доступ
+    response_type = lower.get("response", "Unknown")
+    message = lower.get("message", "")
+    action_id = lower.get("actionid")
 
-    for line in lines:
-        line = line.strip()
-        if not line: continue
+    events = blocks[1:]
+    success = response_type in ("Success", "Follows", "Goodbye", "Pong")
+    return AMIResponse(success, response_type, message, action_id, head, events)
 
-        if in_output:
-            output_lines.append(line)
-            continue
 
-        if ':' in line:
-            key, _, val = line.partition(':')
-            key = key.strip()
-            val = val.strip()
-            headers[key] = val
-            lk = key.lower()
-            if lk == 'response': response_type = val
-            elif lk == 'message': message = val
-            elif lk == 'actionid': action_id = val
-            if lk == 'response' and val.lower() == 'follows':
-                in_output = True
-        elif response_type and response_type.lower() in ('success', 'follows') and 'command output follows' in message.lower():
-            output_lines.append(line)
+# AST device state (числовой Status в событии QueueMember) -> состояние телефона.
+# 1 = Not in use, 6 = Ringing; всё остальное (in use / busy / unavailable /
+# ringinuse / onhold / ...) считаем "used" — как и прежняя текстовая логика,
+# где ringinuse НЕ считался звонком.
+_STATUS_MAP = {
+    "1": "not_in_use",
+    "6": "ringing",
+}
 
-    cleaned = []
-    for ln in output_lines:
-        if ln.startswith("Output: "):
-            cleaned.append(ln[8:])
-        elif ln.startswith("Output:"):
-            cleaned.append(ln[7:].strip())
-        else:
-            cleaned.append(ln)
 
-    success = response_type in ('Success', 'Follows', 'Goodbye')
-    return AMIResponse(success, response_type or "Unknown", message, action_id, headers, cleaned)
-
-def parse_agents(raw_lines: List[str]) -> List[Dict]:
+def parse_queue_members(events: List[Dict]) -> List[Dict]:
+    """Извлекает агентов из событий QueueMember (ответ на действие QueueStatus)."""
     seen_ids = set()
-    result = []
-    for line in raw_lines:
-        if "has taken" not in line.lower():
+    result: List[Dict] = []
+    for ev in events:
+        if ev.get("Event") != "QueueMember":
             continue
-        m = re.match(r"^(\d+)", line)
-        if not m: continue
 
-        low = line.lower()
-        
-        # Точное определение состояния телефона (игнорирует "ringinuse")
-        if "(not in use)" in low:
-            phone_state = "not_in_use"
-        elif "(ring)" in low or "(ringing)" in low:
-            phone_state = "ringing"
-        else:
-            phone_state = "used"  # (in use), (busy), (unavailable) и т.д.
+        # Name = membername. Прежде id брался как ведущие цифры строки `queue show`,
+        # а она начинается именно с membername -> поведение сохранено.
+        name = ev.get("Name", "").strip()
+        m = re.match(r"^(\d+)", name)
+        if not m:
+            continue
+        agent_id = m.group(1)
+        if agent_id in seen_ids:
+            continue
+        seen_ids.add(agent_id)
 
-        agent = {
-            "id": m.group(1),
-            "member": "paused" if "paused" in low else "online",
-            "phone": phone_state
-        }
-        if agent["id"] not in seen_ids:
-            seen_ids.add(agent["id"])
-            result.append(agent)
+        phone_state = _STATUS_MAP.get(ev.get("Status", ""), "used")
+        paused = ev.get("Paused", "0") == "1"
+
+        result.append({
+            "id": agent_id,
+            "member": "paused" if paused else "online",
+            "phone": phone_state,
+        })
     return result

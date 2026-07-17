@@ -41,7 +41,7 @@ class QueueHandler(BaseHTTPRequestHandler):
         # 1. Собираем уникальных агентов из AMI
         seen_ids, ami_agents = set(), {}
         for q in queues:
-            for agent in ami_client.queue_show(q):
+            for agent in ami_client.queue_members(q):
                 if agent["id"] not in seen_ids:
                     seen_ids.add(agent["id"])
                     ami_agents[agent["id"]] = agent
@@ -87,9 +87,10 @@ class QueueHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         log.debug("%s", format % args)
 
-def start_listener(host: str, port: int) -> threading.Thread:
+def start_listener(host: str, port: int) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), QueueHandler)
+    server.daemon_threads = True  # потоки запросов не мешают завершению демона
     log.info(f"HTTP listener started on {host}:{port}")
-    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="http-listener")
     t.start()
-    return t
+    return server
